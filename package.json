@@ -1,0 +1,39 @@
+{
+  "name": "whatsapp-bot-project",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "module": "whatsapp",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "build": "esbuild src/*.js --platform=node --outdir=dist"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "bcrypt": "^5.1.1",
+    "connect-mongo": "^5.1.0",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "csv-parse": "^6.1.0",
+    "dotenv": "^17.2.2",
+    "express": "^5.1.0",
+    "express-session": "^1.18.2",
+    "express-validator": "^7.2.1",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.18.0",
+    "multer": "^2.0.2",
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0",
+    "session-file-store": "^1.5.0",
+    "uuid": "^12.0.0",
+    "whatsapp-web.js": "^1.33.2"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.9",
+    "nodemon": "^3.1.10"
+  }
+}
