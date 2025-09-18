@@ -1,120 +1,107 @@
-const { getQr, getLatestQr, logout, getMessages, getOrCreateClient, getClientByUserId, linkAppUserToSession, getSessionConnectResult, resolveUserIdFromSession } = require("../configs/whatsapp");
+const {
+  getQr,
+  logout,
+  getClientByUserId,
+  linkAppUserToSession,
+  getSessionConnectResult,
+  resolveUserIdFromSession,
+} = require("../configs/whatsapp");
 const User = require("../models/User");
-const { SendMessage,sendAttachment,sendLocation,broadcastMessage,getGroupIds,sendBulkMessages } = require("../services/messageService");
+const {
+  SendMessage,
+  sendAttachment,
+  sendLocation,
+  broadcastMessage,
+  getGroupIds,
+  sendBulkMessages,
+} = require("../services/messageService");
 const Message = require("../models/Message");
-const { normalizeNumber,formatNumber } = require("../utils/numberFormatter");
+const { normalizeNumber, formatNumber } = require("../utils/numberFormatter");
 const path = require("path");
 const { v4: uuidv4 } = require("uuid");
-const QRCode = require("qrcode");
 
+// Helper: verify the account belongs to the authenticated app user and is authenticated
+async function getOwnedAuthenticatedAccount(appUserId, accountId) {
+  const userDoc = await User.findById(appUserId).select("whatsappuser");
+  if (!userDoc) return { error: "User not found", status: 404 };
+  const acc = (userDoc.whatsappuser || []).find(
+    (w) => (w?.clientId === accountId || w?.number === accountId) && w?.qrStatus === "authenticated"
+  );
+  if (!acc) return { error: "Account not found or not authenticated", status: 404 };
+  return { acc };
+}
 
-
-const getQrCode = async (req, res) => {
+// Generate or reuse a QR session for the authenticated app user and return base64 QR JSON
+const generateQrCode = async (req, res) => {
   try {
-    // Always generate a fresh WhatsApp QR session per request
-    const newQrSessionId = uuidv4();
-    req.session.sessionId = newQrSessionId;
-    await new Promise((r) => req.session.save(r));
+    const appUserId = req.appUserId;
+    if (!appUserId) return res.error("Unauthorized", 401);
 
-    // Require user _id, prefer body; fallback to query or existing auth context
-    const providedId = req.body?._id || req.query?._id || req.user?._id || req.session?.authUserId;
-    if (!providedId) return res.error("_id is required", 400);
+    const userDoc = await User.findById(appUserId).select("whatsappuser");
+    if (!userDoc) return res.error("User not found", 404);
 
-    try {
-      const exists = await User.exists({ _id: providedId });
-      if (!exists) return res.error("User not found", 404);
-      // Link app user -> this fresh QR session so we can persist on 'ready'
-      linkAppUserToSession(newQrSessionId, providedId);
-    } catch (e) {
-      console.error("/api/qr user lookup error:", e);
-      return res.error("Failed to verify user", 500);
+    const accounts = userDoc.whatsappuser || [];
+    const pendingAcc = accounts.find((w) => w?.qrStatus === "pending" && !!w?.sessionId);
+
+    let sessionIdToUse;
+    if (pendingAcc) {
+      sessionIdToUse = pendingAcc.sessionId;
+    } else {
+      sessionIdToUse = uuidv4();
+      userDoc.whatsappuser.push({
+        sessionId: sessionIdToUse,
+        qrStatus: "pending",
+        createdAt: new Date(),
+      });
+      await userDoc.save();
     }
 
-    // Kick off client immediately and wait briefly for QR
-    const { qr } = await getQr(newQrSessionId);
+    // Link app user so when the WA client is ready we can persist under this user
+    linkAppUserToSession(sessionIdToUse, appUserId);
+
+    // Ensure a client is initializing and try to fetch a QR (with small wait inside getQr)
+    const { qr, authenticated, userId } = await getQr(sessionIdToUse);
+    if (authenticated) {
+      return res.success({ authenticated: true, account: { number: userId } }, "Already authenticated");
+    }
     if (!qr) return res.error("QR not ready, try again", 503);
 
-    // Return PNG bytes
-    const base64Data = qr.replace(/^data:image\/png;base64,/, "");
-    const imgBuffer = Buffer.from(base64Data, "base64");
-    res.set("Content-Type", "image/png");
-    // Prevent caching so QR stays fresh
-    res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-    res.set("Pragma", "no-cache");
-    res.set("Expires", "0");
-    return res.send(imgBuffer);
+    return res.success({ qrId: sessionIdToUse, qrCode: qr }, "QR generated");
   } catch (err) {
     console.error("❌ Failed to generate/fetch QR:", err);
     return res.error("Failed to generate QR code", 500);
   }
 };
 
-// Report QR status for a specific account/session
-// Accepts: query/body params
-// - userId: Mongo _id of the app user
-// - accountId: identifier of the WA account (matches whatsappuser.clientId or whatsappuser.number)
-// - sessionId: temp QR session id (during pending)
+// Get QR/session status for this app user's QR id
 const getQrStatus = async (req, res) => {
   try {
-    const params = { ...(req.query || {}), ...(req.body || {}) };
-    const { userId: userIdParam, accountId, sessionId: sessionIdParam } = params;
-    const cookieSessionId = req.session?.sessionId;
+    const appUserId = req.appUserId;
+    const qrId = req.query.qrId || req.body?.qrId;
+    if (!appUserId) return res.error("Unauthorized", 401);
+    if (!qrId) return res.error("qrId is required", 400);
 
-    // Prefer explicit sessionId, else cookieSessionId
-    const sessionId = sessionIdParam || cookieSessionId || null;
+    const userDoc = await User.findById(appUserId).select("whatsappuser");
+    if (!userDoc) return res.error("User not found", 404);
 
-    // If identifiers are not provided, fallback to legacy behavior
-    if (!userIdParam && !accountId && !sessionId) {
-      const legacySessionId = req.session.sessionId;
-      if (!legacySessionId) return res.success({ authenticated: false }, "No QR session started yet");
-      const { userId, clientData } = resolveUserIdFromSession(legacySessionId);
-      const auth = !!(userId && clientData?.isAuthenticated);
-      const result = getSessionConnectResult(legacySessionId, { clear: false });
-      return res.success({ authenticated: auth, userId: auth ? userId : null, result }, "QR session status");
-    }
+    const acc = (userDoc.whatsappuser || []).find((w) => w?.sessionId === qrId);
+    if (!acc) return res.success({ status: "not_found" }, "QR not found for this user");
 
-    // Load user and locate the target account entry
-    let userDoc = null;
-    if (userIdParam) {
-      userDoc = await User.findById(userIdParam).select("whatsappuser");
-    } else if (sessionId) {
-      userDoc = await User.findOne({ "whatsappuser.sessionId": sessionId }).select("whatsappuser");
-    }
-
-    if (!userDoc) {
-      return res.error("User or session not found", 404);
-    }
-
-    const accounts = userDoc.whatsappuser || [];
-    let acc = null;
-    if (sessionId) {
-      acc = accounts.find((w) => w?.sessionId === sessionId);
-    }
-    if (!acc && accountId) {
-      acc = accounts.find((w) => w?.clientId === accountId || w?.number === accountId);
-    }
-
-    if (!acc) {
-      return res.success({ status: "not_found" }, "Account not found for provided identifiers");
-    }
-
-    // Derive status and QR
     const status = acc.qrStatus || (acc.clientId ? "authenticated" : "pending");
     const payload = { status };
 
     if (status === "pending") {
-      // Return QR only when pending
       payload.qrCode = acc.qrCode || null;
     } else if (status === "scanned") {
-      // Do not return QR after scanned
       payload.qrCode = null;
     } else if (status === "authenticated") {
-      // Also verify runtime state if possible
-      const { clientData } = sessionId ? resolveUserIdFromSession(sessionId) : { clientData: null };
+      const { clientData } = resolveUserIdFromSession(qrId) || {};
       payload.authenticated = !!clientData?.isAuthenticated || true;
     }
 
-    // Include minimal account info for frontend mapping
+    // Include connection result details if any
+    payload.result = getSessionConnectResult(qrId, { clear: false });
+
     payload.account = {
       name: acc.name || null,
       number: acc.number || null,
@@ -128,59 +115,45 @@ const getQrStatus = async (req, res) => {
   }
 };
 
-// Removed: saveWhatsappUser route flow. Now persisted automatically on WA ready using link from session.
-
-// Send message
+// Send message (by accountId)
 const sendMessage = async (req, res) => {
   try {
-    const { userId, to, message } = req.body;
+    const { accountId, to, message } = req.body;
+    const appUserId = req.appUserId;
 
-    // Validation
-    if (!userId || !to || !message) {
-      return res.error("`userId`, `to`, and `message` are required", 400);
+    if (!accountId || !to || !message) {
+      return res.error("`accountId`, `to`, and `message` are required", 400);
     }
 
-    // Session checks
-    if (!req.session.userId) {
-      console.warn(
-        `❌ No session userId found for request with userId ${userId}, sessionID: ${req.sessionID}`
-      );
-      return res.error("Not authenticated. Please scan QR code at /api/qr.", 401);
-    }
-    if (userId !== req.session.userId) {
-      console.warn(
-        `❌ Unauthorized: userId ${userId} does not match session userId ${req.session.userId}, sessionID: ${req.sessionID}`
-      );
-      return res.error("Unauthorized", 401);
-    }
+    const { acc, error, status } = await getOwnedAuthenticatedAccount(appUserId, accountId);
+    if (error) return res.error(error, status);
 
-    // Call service
-    const result = await SendMessage(userId, to, message);
+    const result = await SendMessage(acc.number, to, message);
 
     if (result.success) {
       return res.success(result, "Message sent successfully");
     } else {
-      // If the error is because the number isn’t on WhatsApp, return 400 (client error), not 500
       if (result.error && result.error.includes("not a registered WhatsApp number")) {
         return res.error(result.error, 400);
       }
       return res.error(result.error || "Failed to send message", 500);
     }
   } catch (err) {
-    console.error(`❌ Send message error for user ${req.body?.userId}:`, err);
+    console.error("❌ Send message error:", err);
     return res.error(err.message || "Internal server error", 500);
   }
 };
-// Get messages
+
+// Get messages (by accountId + phone)
 const getMessagesController = async (req, res) => {
   try {
-    const userId = req.session.userId;
-    if (!userId) {
-      return res.error("Not authenticated", 401);
-    }
+    const appUserId = req.appUserId;
+    const { accountId, phone } = req.params;
 
-    const { phone } = req.params;
-    const clientData = getClientByUserId(userId);
+    const { acc, error, status } = await getOwnedAuthenticatedAccount(appUserId, accountId);
+    if (error) return res.error(error, status);
+
+    const clientData = getClientByUserId(acc.number);
     if (!clientData || !clientData.client) {
       return res.error("WhatsApp client not ready", 500);
     }
@@ -191,11 +164,11 @@ const getMessagesController = async (req, res) => {
     const contactNumber = normalizeNumber(chatId);
 
     const messages = await Message.find({
-      userId,
+      userId: acc.number,
       $or: [
         { from: contactNumber, to: myNumber },
-        { from: myNumber, to: contactNumber }
-      ]
+        { from: myNumber, to: contactNumber },
+      ],
     }).sort({ timestamp: 1 });
 
     res.success(messages, "Conversation fetched");
@@ -204,19 +177,18 @@ const getMessagesController = async (req, res) => {
   }
 };
 
-// Reply to message
+// Reply to message (by accountId)
 const replyMessage = async (req, res) => {
   try {
-    const { userId, messageId, replyText } = req.body;
-    // console.log("Reply request body:", req.body);
-    if (!userId || !messageId || !replyText) {
-      return res.error("`userId`, `messageId`, and `replyText` are required", 400);
+    const { accountId, messageId, replyText } = req.body;
+    if (!accountId || !messageId || !replyText) {
+      return res.error("`accountId`, `messageId`, and `replyText` are required", 400);
     }
-    if (userId !== req.session.userId) {
-      return res.error("Unauthorized", 401);
-    }
+    const appUserId = req.appUserId;
+    const { acc, error, status } = await getOwnedAuthenticatedAccount(appUserId, accountId);
+    if (error) return res.error(error, status);
 
-    const clientData = getClientByUserId(userId);
+    const clientData = getClientByUserId(acc.number);
     if (!clientData || !clientData.client) {
       return res.error("WhatsApp client not ready", 503);
     }
@@ -229,37 +201,38 @@ const replyMessage = async (req, res) => {
 
     const reply = await message.reply(replyText);
     const outgoing = new Message({
-      userId,
+      userId: acc.number,
       from: normalizeNumber(client.info.wid._serialized),
       to: normalizeNumber(message.from),
       body: replyText,
       type: "chat",
       direction: "out",
       status: "sent",
-      messageId: reply.id._serialized
+      messageId: reply.id._serialized,
     });
     await outgoing.save();
     res.success({ messageId: reply.id._serialized }, "Reply sent successfully");
   } catch (err) {
-    console.error(`Reply error for user ${req.body.userId}:`, err);
+    console.error("Reply error:", err);
     res.error(err.message, 500);
   }
 };
 
-// Send attachment
+// Send attachment (by accountId)
 const sendAttachmentMessage = async (req, res) => {
   try {
-    const { userId, to, caption } = req.body;
+    const { accountId, to, caption } = req.body;
     const file = req.file;
-    if (!userId || !to || !file) {
-      return res.error("`userId`, `to`, and file upload are required", 400);
-    }
-    if (userId !== req.session.userId) {
-      return res.error("Unauthorized", 401);
+    if (!accountId || !to || !file) {
+      return res.error("`accountId`, `to`, and file upload are required", 400);
     }
 
-    const filePath = path.join(__dirname, "../Uploads", file.filename);
-    const result = await sendAttachment(userId, to, filePath, caption);
+    const appUserId = req.appUserId;
+    const { acc, error, status } = await getOwnedAuthenticatedAccount(appUserId, accountId);
+    if (error) return res.error(error, status);
+
+    const filePath = path.join(process.cwd(), "uploads", file.filename);
+    const result = await sendAttachment(acc.number, to, filePath, caption);
     if (result.success) {
       res.success(result, "Attachment sent successfully");
     } else {
@@ -270,18 +243,19 @@ const sendAttachmentMessage = async (req, res) => {
   }
 };
 
-// Send location
+// Send location (by accountId)
 const sendLocationMessage = async (req, res) => {
   try {
-    const { userId, to, latitude, longitude, description } = req.body;
-    if (!userId || !to || !latitude || !longitude) {
-      return res.error("`userId`, `to`, `latitude`, and `longitude` are required", 400);
-    }
-    if (userId !== req.session.userId) {
-      return res.error("Unauthorized", 401);
+    const { accountId, to, latitude, longitude, description } = req.body;
+    if (!accountId || !to || !latitude || !longitude) {
+      return res.error("`accountId`, `to`, `latitude`, and `longitude` are required", 400);
     }
 
-    const result = await sendLocation(userId, to, latitude, longitude, description);
+    const appUserId = req.appUserId;
+    const { acc, error, status } = await getOwnedAuthenticatedAccount(appUserId, accountId);
+    if (error) return res.error(error, status);
+
+    const result = await sendLocation(acc.number, to, latitude, longitude, description);
     if (result.success) {
       res.success(result, "Location sent successfully");
     } else {
@@ -292,18 +266,19 @@ const sendLocationMessage = async (req, res) => {
   }
 };
 
-// Broadcast
+// Broadcast (by accountId)
 const broadcast = async (req, res) => {
   try {
-    const { userId, recipients, message } = req.body;
-    if (!userId || !recipients || !Array.isArray(recipients) || !message) {
-      return res.error("`userId`, `recipients` (array), and `message` are required", 400);
-    }
-    if (userId !== req.session.userId) {
-      return res.error("Unauthorized", 401);
+    const { accountId, recipients, message } = req.body;
+    if (!accountId || !recipients || !Array.isArray(recipients) || !message) {
+      return res.error("`accountId`, `recipients` (array), and `message` are required", 400);
     }
 
-    const result = await broadcastMessage(userId, recipients, message);
+    const appUserId = req.appUserId;
+    const { acc, error, status } = await getOwnedAuthenticatedAccount(appUserId, accountId);
+    if (error) return res.error(error, status);
+
+    const result = await broadcastMessage(acc.number, recipients, message);
     if (result.success) {
       res.success(result.results, "Broadcast sent successfully");
     } else {
@@ -314,19 +289,20 @@ const broadcast = async (req, res) => {
   }
 };
 
-// Get message status
+// Get message status (by accountId)
 const getMessageStatus = async (req, res) => {
   try {
-    const { userId, messageId } = req.params;
-    if (!userId || !messageId) {
-      return res.error("`userId` and `messageId` are required", 400);
-    }
-    if (userId !== req.session.userId) {
-      return res.error("Unauthorized", 401);
+    const { accountId, messageId } = req.params;
+    const appUserId = req.appUserId;
+    if (!accountId || !messageId) {
+      return res.error("`accountId` and `messageId` are required", 400);
     }
 
-    const clientData = getClientByUserId(userId);
-    if (!clientData || !clientData.client.info) {
+    const { acc, error, status } = await getOwnedAuthenticatedAccount(appUserId, accountId);
+    if (error) return res.error(error, status);
+
+    const clientData = getClientByUserId(acc.number);
+    if (!clientData || !clientData.client?.info) {
       return res.error("WhatsApp client not ready", 503);
     }
     const client = clientData.client;
@@ -336,9 +312,9 @@ const getMessageStatus = async (req, res) => {
       return res.error("Message not found", 404);
     }
 
-    let status = "sent";
-    if (message.ack >= 2) status = "delivered";
-    if (message.ack >= 3) status = "read";
+    let statusText = "sent";
+    if (message.ack >= 2) statusText = "delivered";
+    if (message.ack >= 3) statusText = "read";
 
     let readBy = null;
     if (message.to.includes("@g.us")) {
@@ -346,53 +322,54 @@ const getMessageStatus = async (req, res) => {
       readBy = info?.read ? Object.keys(info.read) : [];
     }
 
-    res.success({ status, readBy }, "Message status fetched");
+    res.success({ status: statusText, readBy }, "Message status fetched");
   } catch (err) {
     res.error(err.message, 500);
   }
 };
 
-// Get groups
+// Get groups (by accountId in query)
 const getGroups = async (req, res) => {
   try {
-    const userId = req.session.userId;
-    if (!userId) {
-      return res.error("Not authenticated", 401);
-    }
+    const appUserId = req.appUserId;
+    const accountId = req.query.accountId;
+    if (!accountId) return res.error("`accountId` is required", 400);
 
-    const groups = await getGroupIds(userId);
+    const { acc, error, status } = await getOwnedAuthenticatedAccount(appUserId, accountId);
+    if (error) return res.error(error, status);
+
+    const groups = await getGroupIds(acc.number);
     res.success(groups, "Groups fetched");
   } catch (err) {
     res.error(err.message, 500);
   }
 };
 
-// Send bulk messages
+// Send bulk messages (by accountId)
 const sendBulk = async (req, res) => {
   try {
-    const { userId } = req.body;
-    console.log("Bulk send request body:", req.body);
-    if (!userId || !req.file) {
-      return res.error("`userId` and CSV file are required", 400);
-    }
-    if (userId !== req.session.userId) {
-      return res.error("Unauthorized", 401);
+    const { accountId } = req.body;
+    if (!accountId || !req.file) {
+      return res.error("`accountId` and CSV file are required", 400);
     }
 
-    const results = await sendBulkMessages(userId, req.file.path);
+    const appUserId = req.appUserId;
+    const { acc, error, status } = await getOwnedAuthenticatedAccount(appUserId, accountId);
+    if (error) return res.error(error, status);
+
+    const results = await sendBulkMessages(acc.number, req.file.path);
     res.success(results, "Bulk messages sent");
   } catch (err) {
     res.error(err.message, 500);
   }
 };
 
+// List WhatsApp accounts for the authenticated app user
 const getUserWhatsAppAccounts = async (req, res) => {
   try {
-    // Prefer app-authenticated user from JWT, fallback to query/body for flexibility
-    const userId = req.appUserId || req.query.userId || req.body.userId;
-
+    const userId = req.appUserId;
     if (!userId) {
-      return res.status(400).json({ success: false, message: "userId is required" });
+      return res.status(401).json({ success: false, message: "Unauthorized" });
     }
 
     const user = await User.findById(userId).select("whatsappuser");
@@ -410,19 +387,19 @@ const getUserWhatsAppAccounts = async (req, res) => {
   }
 };
 
-// Logout
+// Logout specific WhatsApp account (by accountId)
 const logoutUser = async (req, res) => {
   try {
-    const { userId } = req.body;
-    if (!userId) {
-      return res.error("`userId` is required", 400);
-    }
-    if (userId !== req.session.userId) {
-      return res.error("Unauthorized", 401);
+    const { accountId } = req.body;
+    const appUserId = req.appUserId;
+    if (!accountId) {
+      return res.error("`accountId` is required", 400);
     }
 
-    await logout(userId);
-    req.session.destroy();
+    const { acc, error, status } = await getOwnedAuthenticatedAccount(appUserId, accountId);
+    if (error) return res.error(error, status);
+
+    await logout(acc.number);
     res.success({}, "Logged out successfully");
   } catch (err) {
     res.error(err.message, 500);
@@ -430,11 +407,11 @@ const logoutUser = async (req, res) => {
 };
 
 module.exports = {
-  getQrCode,
+  generateQrCode,
   getQrStatus,
   sendMessage,
   logoutUser,
-  getMessages: getMessagesController, // Renamed to avoid conflict
+  getMessages: getMessagesController,
   replyMessage,
   sendAttachmentMessage,
   sendLocationMessage,
@@ -442,5 +419,6 @@ module.exports = {
   getMessageStatus,
   getGroups,
   sendBulk,
-  getUserWhatsAppAccounts
+  getUserWhatsAppAccounts,
 };
+

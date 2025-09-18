@@ -20,7 +20,9 @@ const ORIGINS = [
 ];
 app.use(cors({
   origin: ORIGINS,
-  credentials: true
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Authorization', 'Content-Type'],
 }));
 app.use(express.json());
 app.use(cookieParser());

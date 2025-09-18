@@ -85,6 +85,8 @@ function createClient(sessionId) {
         if (idx >= 0) {
           appUserDoc.whatsappuser[idx].qrStatus = "scanned";
           appUserDoc.whatsappuser[idx].qrCode = null; // hide QR after scan
+          // IMPORTANT: keep sessionId persisted as the stable LocalAuth key so we can
+          // restore sessions after server restarts without asking for a new QR
           await appUserDoc.save();
         }
       } catch (e) {
@@ -142,14 +144,14 @@ client.on("ready", async () => {
       const qr = clients.get(userId)?.qrCodeUrl || clients.get(sessionId)?.qrCodeUrl || null;
       const name = client.info.pushname || null;
       const number = client.info.wid.user; // raw number, no @c.us
-      const clientId = number; // use wid.user as stable client id
+      const clientId = sessionId; // use sessionId as stable LocalAuth client id
 
       const appUserDoc = await User.findById(appUserId);
       if (appUserDoc) {
         appUserDoc.whatsappuser = appUserDoc.whatsappuser || [];
-        // De-duplicate by clientId or number. If found, update fields; else push new entry.
+        // De-duplicate by sessionId (auth id) or number. If found, update fields; else push new entry.
         let idx = appUserDoc.whatsappuser.findIndex(
-          (w) => w?.clientId === clientId || w?.number === number
+          (w) => w?.sessionId === sessionId || w?.clientId === clientId || w?.number === number
         );
         // Prefer pending entry created for this session
         const pendingIdx = appUserDoc.whatsappuser.findIndex((w) => w?.sessionId === sessionId);
@@ -158,11 +160,11 @@ client.on("ready", async () => {
         if (idx >= 0) {
           appUserDoc.whatsappuser[idx].name = name;
           appUserDoc.whatsappuser[idx].number = number;
-          appUserDoc.whatsappuser[idx].clientId = clientId;
+          appUserDoc.whatsappuser[idx].clientId = clientId; // persist auth client id for restore
           // Update QR tracking fields
           appUserDoc.whatsappuser[idx].qrStatus = "authenticated";
           appUserDoc.whatsappuser[idx].qrCode = null;
-          appUserDoc.whatsappuser[idx].sessionId = undefined;
+          // Keep sessionId so we can restore without QR later
           if (qr) appUserDoc.whatsappuser[idx].qr = qr; // legacy
           // keep original createdAt
           await appUserDoc.save();
@@ -183,7 +185,7 @@ client.on("ready", async () => {
             qr: qr || null, // legacy
             qrCode: null,
             qrStatus: "authenticated",
-            sessionId: undefined,
+            sessionId, // persist auth client id
             createdAt: new Date(),
           });
           await appUserDoc.save();
@@ -279,10 +281,7 @@ function getOrCreateClient(sessionId) {
 
 function getClientByUserId(userId) {
   const key = userId.replace("@c.us", ""); // always raw number
-  console.log("Looking up client for userId:", key);
-  console.log("Current clients map keys:", Array.from(clients.keys()));
   return clients.get(key);
-  // return clients.get(userId);
 }
 
 
