@@ -2,9 +2,10 @@ const { getClientByUserId } = require("../configs/whatsapp");
 const { formatNumber } = require("../utils/numberFormatter");
 const Message = require("../models/Message");
 const { normalizeNumber } = require("../utils/numberFormatter");
-const { Location } = require("whatsapp-web.js");
+const { Location, MessageMedia } = require("whatsapp-web.js");
 const { parse } = require("csv-parse");
 const fs = require("fs");
+const path = require("path");
 
 
 
@@ -252,5 +253,111 @@ const sendBulkMessages = async (userId, filePath) => {
   return results;
 };
 
+const ReplyMessage = async (userId, messageId, replyText) => {
+  try {
+    const clientData = getClientByUserId(userId);
+    if (!clientData || !clientData.client) {
+      throw new Error("Client not found or not authenticated");
+    }
+    const client = clientData.client;
 
-module.exports = { SendMessage, sendAttachment, sendLocation, broadcastMessage, getGroupIds, sendBulkMessages };
+    // Get the original message
+    const message = await client.getMessageById(messageId);
+    if (!message) {
+      throw new Error("Message not found");
+    }
+
+    // Send the reply
+    const response = await message.reply(replyText);
+
+    // Save the reply message to database
+    const outgoing = new Message({
+      userId,
+      from: normalizeNumber(client.info.wid._serialized),
+      to: normalizeNumber(message.from),
+      body: replyText,
+      type: "chat",
+      direction: "out",
+      status: "sent",
+      messageId: response.id._serialized,
+      quotedMessageId: messageId, // Reference to the original message
+    });
+
+    await outgoing.save();
+
+    return { success: true, messageId: response.id._serialized, response };
+  } catch (err) {
+    console.error(`ReplyMessage Error for user ${userId}:`, err.message);
+    return { success: false, error: err.message };
+  }
+};
+
+const SendAttachmentMessage = async (userId, to, file, caption = "") => {
+  try {
+    const clientData = getClientByUserId(userId);
+    if (!clientData || !clientData.client) {
+      throw new Error("Client not found or not authenticated");
+    }
+    const client = clientData.client;
+
+    const formattedTo = formatNumber(to);
+    const phoneNumber = formattedTo.replace("@c.us", "").replace("@g.us", "");
+
+    // Check if number is registered (for individual chats)
+    if (!formattedTo.includes("@g.us")) {
+      const isRegistered = await client.isRegisteredUser(formattedTo);
+      if (!isRegistered) {
+        return { success: false, error: `${to} is not a registered WhatsApp number` };
+      }
+    }
+
+    // Create MessageMedia from file
+    const filePath = path.join(__dirname, "../uploads", file.filename);
+    const media = MessageMedia.fromFilePath(filePath);
+    
+    // Send the attachment
+    const response = await client.sendMessage(formattedTo, media, { caption });
+
+    // Determine message type from MIME type
+    let messageType = "document";
+    if (media.mimetype) {
+      if (media.mimetype.startsWith("image/")) messageType = "image";
+      else if (media.mimetype.startsWith("video/")) messageType = "video";
+      else if (media.mimetype.startsWith("audio/")) messageType = "audio";
+    }
+
+    // Save the message to database
+    const outgoing = new Message({
+      userId,
+      from: normalizeNumber(client.info.wid._serialized),
+      to: normalizeNumber(formattedTo),
+      body: caption || file.originalname,
+      type: messageType,
+      direction: "out",
+      status: response.ack >= 1 ? "delivered" : "sent",
+      messageId: response.id._serialized,
+      mediaUrl: filePath,
+      mediaType: media.mimetype,
+      fileName: file.originalname,
+      fileSize: file.size,
+    });
+
+    await outgoing.save();
+
+    return { success: true, to: phoneNumber, response };
+  } catch (err) {
+    console.error(`SendAttachmentMessage Error for user ${userId}:`, err.message);
+    return { success: false, error: err.message };
+  }
+};
+
+module.exports = { 
+  SendMessage, 
+  sendAttachment, 
+  sendLocation, 
+  broadcastMessage, 
+  getGroupIds, 
+  sendBulkMessages,
+  ReplyMessage,
+  SendAttachmentMessage
+};

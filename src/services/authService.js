@@ -1,7 +1,7 @@
 const bcrypt = require("bcrypt");
 const { validationResult } = require("express-validator");
 const User = require("../models/User");
-const { signJwt } = require("../utils/jwt");
+const { signAccessToken, signRefreshToken } = require("../utils/jwt");
 
 const SALT_ROUNDS = 10;
 
@@ -21,10 +21,26 @@ async function signup(req, res) {
   // Validate
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
-    return res.status(400).json({ success: false, message: "Validation failed", errors: errors.array() });
+    return res
+      .status(400)
+      .json({
+        success: false,
+        message: "Validation failed",
+        errors: errors.array(),
+      });
   }
 
-  const { firstName, lastName, username, email, phone, timezone, password, confirmPassword, termsAccepted } = req.body;
+  const {
+    firstName,
+    lastName,
+    username,
+    email,
+    phone,
+    timezone,
+    password,
+    confirmPassword,
+    termsAccepted,
+  } = req.body;
 
   if (password !== confirmPassword) {
     return res.error("Passwords do not match", 400);
@@ -32,9 +48,18 @@ async function signup(req, res) {
 
   try {
     // Uniqueness checks
-    const existing = await User.findOne({ $or: [{ email: email?.toLowerCase() }, { username: username?.toLowerCase() }, { phone: normalizePhone(phone) }] });
+    const existing = await User.findOne({
+      $or: [
+        { email: email?.toLowerCase() },
+        { username: username?.toLowerCase() },
+        { phone: normalizePhone(phone) },
+      ],
+    });
     if (existing) {
-      return res.error("User with same email/username/phone already exists", 409);
+      return res.error(
+        "User with same email/username/phone already exists",
+        409
+      );
     }
 
     const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
@@ -61,7 +86,13 @@ async function signup(req, res) {
 async function signin(req, res) {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
-    return res.status(400).json({ success: false, message: "Validation failed", errors: errors.array() });
+    return res
+      .status(400)
+      .json({
+        success: false,
+        message: "Validation failed",
+        errors: errors.array(),
+      });
   }
 
   const { email, password, rememberMe } = req.body;
@@ -75,9 +106,26 @@ async function signin(req, res) {
     const ok = await bcrypt.compare(password, user.passwordHash);
     if (!ok) return res.error("Invalid credentials", 401);
 
-    const token = signJwt({ userId: user.id }, { rememberMe: !!rememberMe });
+    const accessToken = signAccessToken({ userId: user.id });
+    const refreshToken = signRefreshToken(
+      { userId: user.id },
+      { rememberMe: !!rememberMe }
+    );
 
-    return res.success({ token, user: user.toJSON() }, "Signed in");
+    // Set httpOnly cookies for tokens for convenience with browsers
+    const cookieOpts = {
+      httpOnly: true,
+      sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
+      secure: process.env.NODE_ENV === "production",
+      path: "/",
+    };
+    res.cookie("token", accessToken, cookieOpts);
+    res.cookie("refreshToken", refreshToken, { ...cookieOpts });
+
+    return res.success(
+      { token: accessToken, refreshToken, user: user.toJSON() },
+      "Signed in"
+    );
   } catch (err) {
     console.error("signin error", err);
     return res.error("Failed to sign in", 500);
