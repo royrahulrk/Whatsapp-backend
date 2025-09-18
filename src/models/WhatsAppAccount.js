@@ -11,25 +11,11 @@ const whatsAppAccountSchema = new mongoose.Schema(
       index: true,
     },
 
-    // WhatsApp identity
-    name: { type: String, trim: true },
-    number: { type: String, trim: true }, // raw number e.g. 916376289176
-    // QR / session tracking
-    qrCode: { type: String, default: null }, // data URL/base64 for UI polling
-    qrStatus: {
+    linkStatus: {
       type: String,
-      enum: ["pending", "scanned", "authenticated", "failed"],
+      enum: ["pending", "authenticated", "failed", 'disconnected'],
       default: undefined,
     },
-
-    // Session management for whatsapp-web.js
-    sessionId: { type: String, unique: true, sparse: true }, // UUID for session identification
-    sessionData: { type: mongoose.Schema.Types.Mixed }, // Store session data if needed
-    lastSeen: { type: Date }, // Last activity timestamp
-    isActive: { type: Boolean, default: false }, // Whether the client is currently active
-
-    // Legacy field kept for back-compat if needed by UI
-    qr: { type: String },
 
     createdAt: { type: Date, default: Date.now },
     updatedAt: { type: Date, default: Date.now },

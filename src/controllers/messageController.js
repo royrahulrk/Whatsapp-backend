@@ -1,14 +1,4 @@
-const {
-  getQr,
-  getLatestQr,
-  logout,
-  getMessages,
-  getOrCreateClient,
-  getClientByUserId,
-  linkAppUserToSession,
-  getSessionConnectResult,
-  resolveUserIdFromSession,
-} = require("../configs/whatsapp");
+const { generateQrForUser, logout } = require("../configs/whatsapp");
 const User = require("../models/User");
 const WhatsAppAccount = require("../models/WhatsAppAccount");
 const {
@@ -29,24 +19,9 @@ const getQrCode = async (req, res) => {
   try {
     // Get user ID from JWT token (set by appAuth middleware)
     const userId = req.appUserId;
-    if (!userId) return res.error("Authentication required", 401);
 
-    // Generate unique session ID for this QR request
-    const newQrSessionId = uuidv4();
-
-    try {
-      const exists = await User.exists({ _id: userId });
-      if (!exists) return res.error("User not found", 404);
-      
-      // Link app user -> this fresh QR session so we can persist on 'ready'
-      // linkAppUserToSession(newQrSessionId, userId);
-    } catch (e) {
-      console.error("/api/qr user lookup error:", e);
-      return res.error("Failed to verify user", 500);
-    }
-    
     // Kick off client immediately and wait briefly for QR
-    const { qr } = await getQr(newQrSessionId);
+    const { qr } = await generateQrForUser(newQrSessionId);
     if (!qr) return res.error("QR not ready, try again", 503);
 
     // Return PNG bytes
@@ -92,10 +67,7 @@ const getQrStatus = async (req, res) => {
     }
 
     if (!acc) {
-      return res.success(
-        { status: "not_found" },
-        "Account not found for user"
-      );
+      return res.success({ status: "not_found" }, "Account not found for user");
     }
 
     // Derive status and QR
@@ -213,13 +185,7 @@ const getMessagesController = async (req, res) => {
       );
     }
 
-    const clientData = getClientByUserId(whatsappAccount.number);
-    if (!clientData || !clientData.client) {
-      return res.error("WhatsApp client not ready", 500);
-    }
-    const client = clientData.client;
-
-    const myNumber = normalizeNumber(client.info.wid._serialized);
+    const myNumber = whatsappAccount.number; // our WA number (userId in messages)
     const chatId = phone.includes("@g.us") ? phone : formatNumber(phone);
     const contactNumber = normalizeNumber(chatId);
 
@@ -274,7 +240,11 @@ const replyMessage = async (req, res) => {
     }
 
     // Call service with the WhatsApp number from the account
-    const result = await ReplyMessage(whatsappAccount.number, messageId, replyText);
+    const result = await ReplyMessage(
+      whatsappAccount.number,
+      messageId,
+      replyText
+    );
 
     if (result.success) {
       return res.success(result, "Reply sent successfully");
@@ -435,7 +405,11 @@ const broadcast = async (req, res) => {
     }
 
     // Call service with the WhatsApp number from the account
-    const result = await broadcastMessage(whatsappAccount.number, recipients, message);
+    const result = await broadcastMessage(
+      whatsappAccount.number,
+      recipients,
+      message
+    );
 
     if (result.success) {
       return res.success(result.results, "Broadcast sent successfully");
@@ -485,30 +459,24 @@ const getMessageStatus = async (req, res) => {
       );
     }
 
-    const clientData = getClientByUserId(whatsappAccount.number);
-    if (!clientData || !clientData.client.info) {
-      return res.error("WhatsApp client not ready", 503);
-    }
-    const client = clientData.client;
-
-    const message = await client.getMessageById(messageId);
-    if (!message) {
+    // Derive status from our DB copy since we no longer use live client API here
+    const doc = await Message.findOne({
+      userId: whatsappAccount.number,
+      messageId,
+    }).lean();
+    if (!doc) {
       return res.error("Message not found", 404);
     }
 
-    let status = "sent";
-    if (message.ack >= 2) status = "delivered";
-    if (message.ack >= 3) status = "read";
-
-    let readBy = null;
-    if (message.to.includes("@g.us")) {
-      const info = await message.getInfo();
-      readBy = info?.read ? Object.keys(info.read) : [];
-    }
-
+    // Map persisted status
+    const status = doc.status || "sent";
+    const readBy = null; // Not tracked without client context for groups
     return res.success({ status, readBy }, "Message status fetched");
   } catch (err) {
-    console.error(`❌ Get message status error for user ${req.appUserId}:`, err);
+    console.error(
+      `❌ Get message status error for user ${req.appUserId}:`,
+      err
+    );
     return res.error(err.message || "Internal server error", 500);
   }
 };
@@ -588,7 +556,10 @@ const sendBulk = async (req, res) => {
       );
     }
 
-    const results = await sendBulkMessages(whatsappAccount.number, req.file.path);
+    const results = await sendBulkMessages(
+      whatsappAccount.number,
+      req.file.path
+    );
     return res.success(results, "Bulk messages sent");
   } catch (err) {
     console.error(`❌ Send bulk error for user ${req.appUserId}:`, err);
